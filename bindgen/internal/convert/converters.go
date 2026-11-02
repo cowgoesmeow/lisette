@@ -180,6 +180,7 @@ func (c *Converter) convertParams(sig *types.Signature, obj types.Object, lookup
 	params := sig.Params()
 	names := paramNames(sig)
 	var out []FunctionParameter
+	var internalSkip *SkipReason
 	for i := 0; i < params.Len(); i++ {
 		param := params.At(i)
 		isVariadicTail := sig.Variadic() && i == params.Len()-1
@@ -196,7 +197,11 @@ func (c *Converter) convertParams(sig *types.Signature, obj types.Object, lookup
 			paramType = convertParamType(param.Type(), optional, c, substitutions)
 		}
 		if paramType.SkipReason != nil {
-			return nil, paramType.SkipReason
+			if paramType.SkipReason.Code != "internal-package-ref" {
+				return nil, paramType.SkipReason
+			}
+			internalSkip = paramType.SkipReason
+			continue
 		}
 
 		typeStr := paramType.LisetteType
@@ -217,6 +222,9 @@ func (c *Converter) convertParams(sig *types.Signature, obj types.Object, lookup
 		}
 
 		out = append(out, FunctionParameter{Name: name, Type: typeStr})
+	}
+	if internalSkip != nil {
+		return nil, internalSkip
 	}
 	return out, nil
 }
@@ -408,13 +416,35 @@ func (c *Converter) convertMethod(result *ConvertResult, symbolExport extract.Sy
 	liftedSpecs, paramOverrides := c.liftReflectionDecodeParams(signature, qualifiedName, methodSpecs)
 
 	params, skip := c.convertParams(signature, symbolExport.Obj, qualifiedName, result.Name, paramOverrides, true, nil)
+	if skip != nil && skip.Code != "internal-package-ref" {
+		result.SkipReason = skip
+		return
+	}
+	returnType := c.applyReturnType(result, signature, symbolExport.Obj, qualifiedName, nil)
+	if hiddenSignatureEligible(signature, skip, returnType.SkipReason) {
+		if symbolExport.BaseType != nil {
+			_, substitutions, _, receiverSkip := collectTypeParams(symbolExport.BaseType.TypeParams(), false, c)
+			if receiverSkip != nil {
+				result.SkipReason = receiverSkip
+				return
+			}
+			if len(substitutions) > 0 {
+				result.SkipReason = &SkipReason{Code: "collapsed-type-param", Message: "receiver type has a shape-collapsed type parameter"}
+				return
+			}
+		}
+		result.SealId = sealIdentity("", result.Name, signature)
+		result.Params = nil
+		result.ReturnType = ""
+		result.CommaOk = false
+		result.SkipNote = nil
+		return
+	}
 	if skip != nil {
 		result.SkipReason = skip
 		return
 	}
 	result.Params = params
-
-	returnType := c.applyReturnType(result, signature, symbolExport.Obj, qualifiedName, nil)
 
 	lookups := []configKey{{c.currentPkgPath, qualifiedName}}
 	if symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
@@ -2128,13 +2158,131 @@ func sealQualifier(p *types.Package) string {
 	return p.Path()
 }
 
-// sealIdentity is an unexported method's package-qualified identity: declaring
-// package, name, and signature (receiver excluded). A seal and a method that
-// implements it share it; a different signature or package does not.
+func hiddenSignatureEligible(sig *types.Signature, skips ...*SkipReason) bool {
+	internal := false
+	for _, skip := range skips {
+		if skip != nil {
+			if skip.Code != "internal-package-ref" {
+				return false
+			}
+			internal = true
+		}
+	}
+	if !internal {
+		return false
+	}
+	_, ok := hiddenIdentityType(sig)
+	return ok
+}
+
+// Anonymous members and type parameters cannot be represented by a literal seal.
+func hiddenIdentityType(t types.Type) (types.Type, bool) {
+	t = types.Unalias(t)
+	switch typ := t.(type) {
+	case *types.Basic:
+		return types.Typ[typ.Kind()], true
+	case *types.Named:
+		args := typ.TypeArgs()
+		if args.Len() == 0 {
+			return t, true
+		}
+		normalized := make([]types.Type, args.Len())
+		changed := false
+		for i := range normalized {
+			var ok bool
+			normalized[i], ok = hiddenIdentityType(args.At(i))
+			if !ok {
+				return t, false
+			}
+			changed = changed || normalized[i] != args.At(i)
+		}
+		if !changed {
+			return t, true
+		}
+		instance, err := types.Instantiate(nil, typ.Origin(), normalized, false)
+		return instance, err == nil
+	case *types.Pointer:
+		elem, ok := hiddenIdentityType(typ.Elem())
+		if !ok || elem == typ.Elem() {
+			return t, ok
+		}
+		return types.NewPointer(elem), ok
+	case *types.Slice:
+		elem, ok := hiddenIdentityType(typ.Elem())
+		if !ok || elem == typ.Elem() {
+			return t, ok
+		}
+		return types.NewSlice(elem), ok
+	case *types.Array:
+		elem, ok := hiddenIdentityType(typ.Elem())
+		if !ok || elem == typ.Elem() {
+			return t, ok
+		}
+		return types.NewArray(elem, typ.Len()), ok
+	case *types.Map:
+		key, keyOK := hiddenIdentityType(typ.Key())
+		elem, elemOK := hiddenIdentityType(typ.Elem())
+		if !keyOK || !elemOK || key == typ.Key() && elem == typ.Elem() {
+			return t, keyOK && elemOK
+		}
+		return types.NewMap(key, elem), keyOK && elemOK
+	case *types.Chan:
+		elem, ok := hiddenIdentityType(typ.Elem())
+		if !ok || elem == typ.Elem() {
+			return t, ok
+		}
+		return types.NewChan(typ.Dir(), elem), ok
+	case *types.Tuple:
+		var vars []*types.Var
+		for i := range typ.Len() {
+			v := typ.At(i)
+			elem, ok := hiddenIdentityType(v.Type())
+			if !ok {
+				return t, false
+			}
+			if vars == nil && (v.Name() != "" || elem != v.Type()) {
+				vars = make([]*types.Var, typ.Len())
+				for j := range i {
+					vars[j] = typ.At(j)
+				}
+			}
+			if vars != nil {
+				vars[i] = v
+				if v.Name() != "" || elem != v.Type() {
+					vars[i] = types.NewVar(v.Pos(), v.Pkg(), "", elem)
+				}
+			}
+		}
+		if vars == nil {
+			return t, true
+		}
+		return types.NewTuple(vars...), true
+	case *types.Signature:
+		if typ.TypeParams().Len() != 0 {
+			return t, false
+		}
+		params, paramsOK := hiddenIdentityType(typ.Params())
+		results, resultsOK := hiddenIdentityType(typ.Results())
+		if !paramsOK || !resultsOK {
+			return t, false
+		}
+		if typ.Recv() == nil && params == typ.Params() && results == typ.Results() {
+			return t, true
+		}
+		return types.NewSignatureType(nil, nil, nil, params.(*types.Tuple), results.(*types.Tuple), typ.Variadic()), true
+	default:
+		return t, false
+	}
+}
+
+// sealIdentity includes the declaring package only for unexported names.
+// Signature types always retain their full package paths; receivers are excluded.
 func sealIdentity(pkgPath, name string, sig *types.Signature) string {
 	var b strings.Builder
-	b.WriteString(pkgPath)
-	b.WriteString(".")
+	if !token.IsExported(name) {
+		b.WriteString(pkgPath)
+		b.WriteString(".")
+	}
 	b.WriteString(name)
 	b.WriteString("(")
 	if sig != nil {
@@ -2146,7 +2294,11 @@ func sealIdentity(pkgPath, name string, sig *types.Signature) string {
 			if sig.Variadic() && i == params.Len()-1 {
 				b.WriteString("...")
 			}
-			b.WriteString(types.TypeString(params.At(i).Type(), sealQualifier))
+			typ := params.At(i).Type()
+			if token.IsExported(name) {
+				typ, _ = hiddenIdentityType(typ)
+			}
+			b.WriteString(types.TypeString(typ, sealQualifier))
 		}
 	}
 	b.WriteString(")")
@@ -2157,7 +2309,11 @@ func sealIdentity(pkgPath, name string, sig *types.Signature) string {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			b.WriteString(types.TypeString(results.At(i).Type(), sealQualifier))
+			typ := results.At(i).Type()
+			if token.IsExported(name) {
+				typ, _ = hiddenIdentityType(typ)
+			}
+			b.WriteString(types.TypeString(typ, sealQualifier))
 		}
 	}
 	return b.String()
@@ -2165,8 +2321,8 @@ func sealIdentity(pkgPath, name string, sig *types.Signature) string {
 
 // extractInterfaceMethods walks a Go interface's method set and converts each to
 // a Lisette InterfaceMethod. The second return value is false when an embedded
-// union or an unrepresentable exported param/return type is encountered.
-// Unexported methods are recorded by their seal identity only.
+// union or an exported signature that cannot be represented even by identity is encountered.
+// Unexported and eligible internal-reference methods retain only their seal identity.
 func (c *Converter) extractInterfaceMethods(_interface *types.Interface, typeName string) ([]InterfaceMethod, bool) {
 	if _interface.NumEmbeddeds() > 0 {
 		for embedded := range _interface.EmbeddedTypes() {
@@ -2195,12 +2351,18 @@ func (c *Converter) extractInterfaceMethods(_interface *types.Interface, typeNam
 
 		qualifiedName := typeName + "." + method.Name()
 		params, skip := c.convertParams(signature, method, qualifiedName, method.Name(), nil, false, nil)
-		if skip != nil {
+		if skip != nil && skip.Code != "internal-package-ref" {
 			return nil, false
 		}
-
 		returnType := ReturnsToLisette(signature, c, method, qualifiedName)
-		if returnType.SkipReason != nil {
+		if hiddenSignatureEligible(signature, skip, returnType.SkipReason) {
+			methods = append(methods, InterfaceMethod{
+				Name:   method.Name(),
+				SealId: sealIdentity(method.Pkg().Path(), method.Name(), signature),
+			})
+			continue
+		}
+		if skip != nil || returnType.SkipReason != nil {
 			return nil, false
 		}
 

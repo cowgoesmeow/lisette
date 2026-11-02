@@ -23,3 +23,39 @@ type Holder struct {
 type Local struct {
 	Value int
 }
+
+type Consumer interface {
+	AttachContent(*inner.Thing)
+}
+
+type Producer interface {
+	Current() *inner.Thing
+}
+
+type Content interface {
+	Consumer
+	Producer
+	Label() string
+}
+
+type ValueContent struct{}
+
+func (ValueContent) AttachContent(*inner.Thing) {}
+func (ValueContent) Current() *inner.Thing      { return nil }
+func (ValueContent) Label() string              { return "value" }
+
+type PointerContent struct {
+	Value int
+}
+
+func (c *PointerContent) AttachContent(v *inner.Thing) { c.Value = v.Value }
+func (c *PointerContent) Current() *inner.Thing        { return nil }
+func (c *PointerContent) Label() string                { return "pointer" }
+
+type GenericConsumer[T any] interface {
+	AttachContent(*inner.Thing, T)
+}
+
+type GenericContent[T any] struct{}
+
+func (GenericContent[T]) AttachContent(*inner.Thing, T) {}

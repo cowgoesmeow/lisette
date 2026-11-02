@@ -368,10 +368,15 @@ func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Typ
 
 	var elems []string
 	anyApplied := false
+	var internalSkip *SkipReason
 	for i := start; i < end; i++ {
 		elem := conv.resultType(obj, results, i, seen, substitutions, qualifiedName)
 		if elem.SkipReason != nil {
-			return elem
+			if elem.SkipReason.Code != "internal-package-ref" {
+				return elem
+			}
+			internalSkip = elem.SkipReason
+			continue
 		}
 		wrapped, applied := maybeWrapNilableFunction(results.At(i).Type(), elem.LisetteType, conv, qualifiedName)
 		if applied {
@@ -380,6 +385,9 @@ func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Typ
 			wrapped = optionOf(wrapped)
 		}
 		elems = append(elems, wrapped)
+	}
+	if internalSkip != nil {
+		return TypeResult{SkipReason: internalSkip}
 	}
 
 	return TypeResult{

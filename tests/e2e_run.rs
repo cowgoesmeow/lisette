@@ -152,6 +152,250 @@ fn assert_rejected_at_check(output: &Output, expected: &str) {
     );
 }
 
+fn internal_signature_project(root: &Path) -> PathBuf {
+    let goapi = root.join("goapi");
+    let project = root.join("lis");
+    for directory in ["internal/inner", "internal/other", "ui"] {
+        fs::create_dir_all(goapi.join(directory)).unwrap();
+    }
+    fs::create_dir_all(project.join("src")).unwrap();
+    for (name, source) in [
+        ("go.mod", "module example.com/issue1601\n\ngo 1.23\n"),
+        (
+            "internal/inner/inner.go",
+            "package inner\n\ntype Conn struct { Value int }\ntype Failure struct{}\nfunc (*Failure) Error() string { return \"internal failure\" }\n",
+        ),
+        (
+            "internal/other/other.go",
+            "package other\n\ntype Conn struct { Value int }\n",
+        ),
+        (
+            "content.go",
+            r#"package issue1601
+
+import "example.com/issue1601/internal/inner"
+
+type Content interface { AttachContent(*inner.Conn) }
+type Result interface { Current() *inner.Conn }
+type Mixed interface {
+	Content
+	Result
+	Label() string
+}
+type Embedded interface { Mixed }
+type Generic[T any] interface { AttachGeneric(*inner.Conn, T) }
+type Failing interface { Fail() *inner.Failure }
+type Callback interface { Visit(func(x *inner.Conn)) int }
+type BasicAliases interface {
+	Bytes(*inner.Conn, byte)
+	Runes(*inner.Conn, rune)
+}
+
+func Accept(c Content) int {
+	conn := &inner.Conn{Value: 40}
+	c.AttachContent(conn)
+	return conn.Value
+}
+func Read(r Result) int { return r.Current().Value }
+func Describe(m Mixed) string { return m.Label() }
+func AcceptEmbedded(e Embedded) int { return Accept(e) + Read(e) }
+func AcceptGeneric(g Generic[int]) {}
+func AcceptCallback(c Callback) int {
+	return c.Visit(func(conn *inner.Conn) { conn.Value += 1 })
+}
+func AcceptBasicAliases(a BasicAliases) int {
+	conn := &inner.Conn{}
+	a.Bytes(conn, 5)
+	a.Runes(conn, 7)
+	return conn.Value
+}
+"#,
+        ),
+        (
+            "ui/content.go",
+            r#"package ui
+
+import (
+	"example.com/issue1601/internal/inner"
+	"example.com/issue1601/internal/other"
+)
+
+type Pointer struct { value int }
+func NewPointer() *Pointer { return &Pointer{} }
+func NewPointerValue() Pointer { return Pointer{} }
+func (p *Pointer) AttachContent(c *inner.Conn) { p.value++; c.Value += p.value }
+func (p *Pointer) Current() *inner.Conn { return &inner.Conn{Value: p.value} }
+func (p *Pointer) Label() string { return "pointer" }
+func (p *Pointer) Fail() *inner.Failure { return &inner.Failure{} }
+func (p *Pointer) Visit(callback func(y *inner.Conn)) int {
+	conn := &inner.Conn{Value: 30}
+	callback(conn)
+	return conn.Value
+}
+func (p *Pointer) Bytes(conn *inner.Conn, value uint8) { conn.Value += int(value) }
+func (p *Pointer) Runes(conn *inner.Conn, value int32) { conn.Value += int(value) }
+
+type Value struct{}
+func NewValue() Value { return Value{} }
+func (Value) AttachContent(c *inner.Conn) { c.Value += 2 }
+func (Value) Current() *inner.Conn { return &inner.Conn{Value: 7} }
+func (Value) Label() string { return "value" }
+
+type Wrong struct{}
+func NewWrong() Wrong { return Wrong{} }
+func (Wrong) AttachContent(int) {}
+type Different struct{}
+func NewDifferent() Different { return Different{} }
+func (Different) AttachContent(*other.Conn) {}
+type WrongResult struct{}
+func NewWrongResult() WrongResult { return WrongResult{} }
+func (WrongResult) Current() *other.Conn { return &other.Conn{} }
+
+type Generic[T any] struct{}
+func (Generic[T]) AttachGeneric(*inner.Conn, T) {}
+func NewStringGeneric() Generic[string] { return Generic[string]{} }
+"#,
+        ),
+    ] {
+        fs::write(goapi.join(name), source).unwrap();
+    }
+    fs::write(
+        project.join("lisette.toml"),
+        r#"[project]
+name = "issue1601proof"
+version = "0.1.0"
+
+[dependencies.go]
+"example.com/issue1601" = { path = "../goapi" }
+"#,
+    )
+    .unwrap();
+    project
+}
+
+#[test]
+fn internal_signature_interfaces_run() {
+    if !go_available() {
+        eprintln!("skipping internal_signature_interfaces_run: `go` not found");
+        return;
+    }
+    let scratch = tempfile::tempdir().expect("create temp dir");
+    let project = internal_signature_project(scratch.path());
+    fs::write(
+        project.join("src/main.lis"),
+        r#"import "go:fmt"
+import "go:example.com/issue1601"
+import "go:example.com/issue1601/ui"
+
+fn main() {
+  let mut pointer = ui.NewPointer()
+  fmt.Println(issue1601.Accept(pointer))
+  fmt.Println(issue1601.Read(pointer))
+  let mixed: issue1601.Mixed = pointer
+  fmt.Println(mixed.Label())
+  fmt.Println(issue1601.Describe(mixed))
+  fmt.Println(issue1601.AcceptEmbedded(pointer))
+  let value = ui.NewValue()
+  fmt.Println(issue1601.Accept(value))
+  fmt.Println(issue1601.Read(value))
+  fmt.Println(issue1601.AcceptEmbedded(value))
+  fmt.Println(pointer.Fail())
+  let failing: issue1601.Failing = pointer
+  fmt.Println(failing.Fail())
+  fmt.Println(issue1601.AcceptCallback(pointer))
+  fmt.Println(issue1601.AcceptBasicAliases(pointer))
+}
+"#,
+    )
+    .unwrap();
+    let output = lis_run(&project, scratch.path(), &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "41\n1\npointer\npointer\n44\n42\n7\n49\ninternal failure\ninternal failure\n31\n12"
+    );
+}
+
+#[test]
+fn internal_signature_interfaces_rejected_at_check() {
+    if !go_available() {
+        eprintln!("skipping internal_signature_interfaces_rejected_at_check: `go` not found");
+        return;
+    }
+    let scratch = tempfile::tempdir().expect("create temp dir");
+    let project = internal_signature_project(scratch.path());
+    for (name, source, expected) in [
+        (
+            "wrong parameter",
+            "fn main() { let _ = issue1601.Accept(ui.NewWrong()) }",
+            "sealed interface",
+        ),
+        (
+            "different internal parameter",
+            "fn main() { let _ = issue1601.Accept(ui.NewDifferent()) }",
+            "sealed interface",
+        ),
+        (
+            "different internal result",
+            "fn main() { let _ = issue1601.Read(ui.NewWrongResult()) }",
+            "sealed interface",
+        ),
+        (
+            "source lookalike",
+            "struct Mine {}\nimpl Mine { fn AttachContent(self) {} }\nfn main() { let _ = issue1601.Accept(Mine {}) }",
+            "sealed interface",
+        ),
+        (
+            "forged identity",
+            r#"struct Mine {}
+impl Mine {
+  #[go(unexported, "AttachContent(*example.com/issue1601/internal/inner.Conn)")]
+  fn AttachContent(self) {}
+}
+fn main() { let _ = issue1601.Accept(Mine {}) }"#,
+            "sealed interface",
+        ),
+        (
+            "pointer-only value",
+            "fn main() { let _ = issue1601.Accept(ui.NewPointerValue()) }",
+            "does not implement",
+        ),
+        (
+            "read-only reference",
+            "fn sneak(p: Ref<ui.Pointer>) { let _ = issue1601.Accept(p) }\nfn main() {}",
+            "Missing write permission",
+        ),
+        (
+            "hidden concrete call",
+            "fn main() { ui.NewPointer().AttachContent() }",
+            "Member not found",
+        ),
+        (
+            "hidden interface call",
+            "fn sneak(c: issue1601.Content) { c.AttachContent() }\nfn main() {}",
+            "Member not found",
+        ),
+        (
+            "generic mismatch",
+            "fn main() { issue1601.AcceptGeneric(ui.NewStringGeneric()) }",
+            "Type mismatch",
+        ),
+    ] {
+        fs::write(
+            project.join("src/main.lis"),
+            format!(
+                "import \"go:example.com/issue1601\"\nimport \"go:example.com/issue1601/ui\"\n\n{source}\n"
+            ),
+        )
+        .unwrap();
+        let output = lis(&project, "check");
+        eprintln!("internal signature rejection case: {name}");
+        assert_rejected_at_check(&output, expected);
+    }
+}
+
 #[test]
 fn parallel_strengthened_impl_bound_rejected() {
     if !go_available() {

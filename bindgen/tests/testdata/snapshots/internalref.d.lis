@@ -11,6 +11,23 @@
 /// Should be skipped: function returning a type from an internal package.
 pub fn GetInner() -> Option<Unknown>
 
+pub interface Consumer {
+  #[go(unexported, "AttachContent(*github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing)")]
+  fn AttachContent()
+}
+
+pub interface Content {
+  #[go(unexported, "AttachContent(*github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing)")]
+  fn AttachContent()
+  #[go(unexported, "Current() *github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing")]
+  fn Current()
+  fn Label() -> string
+}
+
+pub type GenericConsumer<T>
+
+pub type GenericContent<T>
+
 /// Field referencing an internal package is dropped, leaving a struct
 /// that still emits its remaining exported fields.
 #[go(hidden_fields)]
@@ -24,8 +41,39 @@ pub struct Local {
   pub Value: int,
 }
 
+pub struct PointerContent {
+  pub Value: int,
+}
+
+pub interface Producer {
+  #[go(unexported, "Current() *github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing")]
+  fn Current()
+}
+
+pub type ValueContent
+
 // SKIPPED type-with: internal-package-ref
 // references type from internal package "github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner"
 /// Package-level variable typed by an internal package — type collapses to
 /// Unknown so the symbol stays referenceable as an opaque value.
 pub var GlobalInner: Unknown
+
+impl<T> GenericContent<T> {
+  // SKIPPED method "AttachContent": internal-package-ref — references type from internal package "github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner"
+}
+
+impl PointerContent {
+  #[go(unexported, "AttachContent(*github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing)")]
+  fn AttachContent(self: mut Ref<PointerContent>)
+  #[go(unexported, "Current() *github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing")]
+  fn Current(self: Ref<PointerContent>)
+  fn Label(self: Ref<PointerContent>) -> string
+}
+
+impl ValueContent {
+  #[go(unexported, "AttachContent(*github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing)")]
+  fn AttachContent(self)
+  #[go(unexported, "Current() *github.com/ivov/lisette/bindgen/tests/testdata/fixtures/internalref/internal/inner.Thing")]
+  fn Current(self)
+  fn Label(self) -> string
+}

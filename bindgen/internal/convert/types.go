@@ -125,12 +125,15 @@ func toLisetteRecursive(t types.Type, seen map[types.Type]bool, conv *Converter,
 
 	case *types.Map:
 		key := toLisetteRecursive(t.Key(), seen, conv, substitutions)
-		if key.SkipReason != nil {
+		if key.SkipReason != nil && key.SkipReason.Code != "internal-package-ref" {
 			return key
 		}
 		val := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if val.SkipReason != nil {
 			return val
+		}
+		if key.SkipReason != nil {
+			return key
 		}
 		return TypeResult{LisetteType: mapOf(key.LisetteType, val.LisetteType)}
 
@@ -263,17 +266,22 @@ func basicToLisette(t *types.Basic) string {
 
 func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
 	var params []string
+	var internalSkip *SkipReason
 
 	param := signature.Params()
 	for param := range param.Variables() {
 		paramType := writableRecursive(param.Type(), seen, conv, substitutions, false)
 		if paramType.SkipReason != nil {
-			return paramType
+			if paramType.SkipReason.Code != "internal-package-ref" {
+				return paramType
+			}
+			internalSkip = paramType.SkipReason
+			continue
 		}
 		params = append(params, paramType.LisetteType)
 	}
 
-	if signature.Variadic() && param.Len() > 0 {
+	if internalSkip == nil && signature.Variadic() && param.Len() > 0 {
 		lastIdx := len(params) - 1
 		params[lastIdx] = sliceToVarArgs(params[lastIdx])
 	}
@@ -282,9 +290,15 @@ func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, co
 	if signature.Results().Len() > 0 {
 		ret := returnsToLisetteRecursive(signature, seen, conv, nil, "", substitutions)
 		if ret.SkipReason != nil {
-			return ret
+			if ret.SkipReason.Code != "internal-package-ref" {
+				return ret
+			}
+			internalSkip = ret.SkipReason
 		}
 		returnType = ret.LisetteType
+	}
+	if internalSkip != nil {
+		return TypeResult{SkipReason: internalSkip}
 	}
 
 	return TypeResult{LisetteType: fmt.Sprintf("fn(%s) -> %s", strings.Join(params, ", "), returnType)}
@@ -300,17 +314,20 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter, s
 
 	isExternal := false
 	pkgPrefix := ""
+	var internalSkip *SkipReason
 	if pkg != nil && conv != nil && pkg.Path() != conv.currentPkgPath {
 		if extract.IsInternalPackagePath(pkg.Path()) {
-			return TypeResult{SkipReason: &SkipReason{
+			internalSkip = &SkipReason{
 				Code:    "internal-package-ref",
 				Message: fmt.Sprintf("references type from internal package %q", pkg.Path()),
-			}}
+			}
+			isExternal = true
+		} else {
+			isExternal = true
+			// Sentinel-wrapped path; the emitter resolves it after collision detection.
+			pkgPrefix = PkgRef(pkg.Path())
+			conv.trackExternalPkg(pkg.Path(), pkg.Name())
 		}
-		isExternal = true
-		// Sentinel-wrapped path; the emitter resolves it after collision detection.
-		pkgPrefix = PkgRef(pkg.Path())
-		conv.trackExternalPkg(pkg.Path(), pkg.Name())
 	}
 
 	if !isExternal && !obj.Exported() {
@@ -347,9 +364,16 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter, s
 		for arg := range typeArgs.Types() {
 			result := toLisetteRecursive(arg, seen, conv, substitutions)
 			if result.SkipReason != nil {
-				return result
+				if result.SkipReason.Code != "internal-package-ref" {
+					return result
+				}
+				internalSkip = result.SkipReason
+				continue
 			}
 			args = append(args, result.LisetteType)
+		}
+		if internalSkip != nil {
+			return TypeResult{SkipReason: internalSkip}
 		}
 		if isExternal {
 			typeName = pkgPrefix + "." + obj.Name()
@@ -357,6 +381,9 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter, s
 			typeName = SelfQualify(pkg.Name(), obj.Name(), t.Origin().TypeParams().Len())
 		}
 		return TypeResult{LisetteType: fmt.Sprintf("%s<%s>", typeName, strings.Join(args, ", "))}
+	}
+	if internalSkip != nil {
+		return TypeResult{SkipReason: internalSkip}
 	}
 
 	if pkg == nil {
@@ -480,12 +507,15 @@ func writableRecursive(t types.Type, seen map[types.Type]bool, conv *Converter, 
 
 	case *types.Map:
 		key := writableRecursive(u.Key(), seen, conv, substitutions, false)
-		if key.SkipReason != nil {
+		if key.SkipReason != nil && key.SkipReason.Code != "internal-package-ref" {
 			return key
 		}
 		val := writableRecursive(u.Elem(), seen, conv, substitutions, nilable)
 		if val.SkipReason != nil {
 			return val
+		}
+		if key.SkipReason != nil {
+			return key
 		}
 		rendered := "mut " + mapOf(key.LisetteType, val.LisetteType)
 		if nilable {
@@ -590,12 +620,15 @@ func toLisetteNilableRecursive(t types.Type, seen map[types.Type]bool, conv *Con
 
 	case *types.Map:
 		key := toLisetteRecursive(t.Key(), seen, conv, substitutions)
-		if key.SkipReason != nil {
+		if key.SkipReason != nil && key.SkipReason.Code != "internal-package-ref" {
 			return key
 		}
 		val := toLisetteNilableRecursive(t.Elem(), seen, conv, substitutions)
 		if val.SkipReason != nil {
 			return val
+		}
+		if key.SkipReason != nil {
+			return key
 		}
 		return TypeResult{LisetteType: mapOf(key.LisetteType, val.LisetteType)}
 
